@@ -5,8 +5,14 @@ import GUI from 'lil-gui';
 import './style.css';
 
 // --- CONFIGURATION ---
+interface SensorSnapshot {
+  date: string;
+  sensors: number[];
+}
+
 interface CableConfig {
-  sensors: number[]; // Array of temperatures
+  sensors: number[]; // Initial/Default temperatures
+  history?: SensorSnapshot[];
   level?: number;
   bottomOffset?: number;
   topOffset?: number;
@@ -37,6 +43,7 @@ interface SiloConfig {
 let SILO_RADIUS = 5;
 let SILO_HEIGHT = 15;
 let GRAIN_HEIGHT = 12;
+const ROOF_SLOPE = 0.3; // 30% slope
 let TEMPERATURE_MIN = 10;
 let TEMPERATURE_MAX = 50;
 
@@ -161,7 +168,12 @@ class SiloApp {
   camera: THREE.PerspectiveCamera;
   renderer: THREE.WebGLRenderer;
   controls: OrbitControls;
-  sensors: { pos: THREE.Vector3, temp: number, baseTemp: number }[] = [];
+  sensors: { 
+    pos: THREE.Vector3, 
+    temp: number, 
+    baseTemp: number, 
+    history: { timestamp: number, temperatures: number[] }[] 
+  }[] = [];
   cableLevels: { pos: THREE.Vector2, height: number }[] = [];
   grainPoints: THREE.Points | null = null;
   sensorLabels: CSS2DObject[] = []
@@ -171,7 +183,14 @@ class SiloApp {
   clippingPlane: THREE.Plane;
   gui: GUI = new GUI();
 
+  timelineStart = 0;
+  timelineEnd = 0;
+
   params = {
+    timelineValue: 0, // 0 to 1 progress of the entire range
+    playbackDate: '',
+    isPlaying: false,
+    playSpeed: 1, // multiplier
     slicing: 5,
     showSilo: true,
     showSensors: true,
@@ -213,14 +232,20 @@ class SiloApp {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.localClippingEnabled = true;
-    document.getElementById('app')?.appendChild(this.renderer.domElement);
+    const container = document.getElementById('app');
+    if (container) {
+      container.innerHTML = '';
+      container.appendChild(this.renderer.domElement);
+    }
 
     this.labelRenderer = new CSS2DRenderer();
     this.labelRenderer.setSize(window.innerWidth, window.innerHeight);
     this.labelRenderer.domElement.style.position = 'absolute';
     this.labelRenderer.domElement.style.top = '0px';
     this.labelRenderer.domElement.style.pointerEvents = 'none';
-    document.getElementById('app')?.appendChild(this.labelRenderer.domElement);
+    if (container) {
+      container.appendChild(this.labelRenderer.domElement);
+    }
 
     this.hotLabel = this.createLabel('ZONA QUENTE', 'hot-label');
     this.coldLabel = this.createLabel('ZONA FRIA', 'cold-label');
@@ -238,7 +263,10 @@ class SiloApp {
 
     this.initLights();
     this.initSilo();
-    this.initSensors();
+    this.initSensors(); // This will populate `this.sensors`
+    
+    this.params.timelineValue = 0;
+
     this.initGrainMass();
     this.initGUI();
 
@@ -316,11 +344,10 @@ class SiloApp {
           if (levelIndex > 0) {
             const ratio = Math.min(levelIndex - 1, sensorCount - 1) / Math.max(sensorCount - 1, 1);
             visualHeight = bottomOffset + ratio * (sensorsTop - bottomOffset);
-            visualHeight += 0.3; // "Ligeiramente acima" offset
           }
 
           this.cableLevels.push({ pos: new THREE.Vector2(x, z), height: visualHeight });
-          this.addCable(x, z, cable.sensors.length, cable.sensors, bottomOffset, topOffset);
+          this.addCable(x, z, cable.sensors.length, cable.sensors, cable.history, bottomOffset, topOffset);
         });
       } else if (ring.cableCount && ring.sensorsPerCable) {
         // Fallback to auto-generation
@@ -330,12 +357,33 @@ class SiloApp {
           const z = Math.sin(angle) * radius;
 
           this.cableLevels.push({ pos: new THREE.Vector2(x, z), height: GRAIN_HEIGHT });
-          this.addCable(x, z, ring.sensorsPerCable);
+          this.addCable(x, z, ring.sensorsPerCable, []);
         }
       }
     });
 
     this.initGrainMass();
+
+    // Determine Timeline Range from sensors
+    let minTime = Infinity;
+    let maxTime = -Infinity;
+    this.sensors.forEach(s => {
+      s.history.forEach(h => {
+        if (h.timestamp < minTime) minTime = h.timestamp;
+        if (h.timestamp > maxTime) maxTime = h.timestamp;
+      });
+    });
+
+    if (minTime === Infinity) {
+      this.timelineStart = Date.now();
+      this.timelineEnd = Date.now() + 86400000 * 10; // Default 10 days
+    } else {
+      this.timelineStart = minTime;
+      this.timelineEnd = maxTime;
+    }
+
+    this.params.timelineValue = 0;
+    this.updateInterpolation();
 
     // Update UI constraints if needed (lil-gui doesn't update min/max easily without recreation)
     this.params.slicing = SILO_RADIUS;
@@ -350,7 +398,7 @@ class SiloApp {
     }
   }
 
-  addCable(x: number, z: number, count: number, temperatures?: number[], bottomOffset?: number, topOffset?: number) {
+  addCable(x: number, z: number, count: number, initialTemps: number[], history?: SensorSnapshot[], bottomOffset?: number, topOffset?: number) {
     const sensorGeo = new THREE.SphereGeometry(0.1, 8, 8);
     const sensorMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
     const bOffset = bottomOffset !== undefined ? bottomOffset : 0;
@@ -382,11 +430,13 @@ class SiloApp {
       const pos = new THREE.Vector3(x, y, z);
 
       // Use provided temp or initial random
-      const temp = (temperatures && temperatures[s] !== undefined)
-        ? temperatures[s]
-        : TEMPERATURE_MIN + Math.random() * (TEMPERATURE_MAX - TEMPERATURE_MIN);
+      const temp = initialTemps[s] !== undefined ? initialTemps[s] : 25;
+      const parsedHistory = history ? history.map(h => ({
+        timestamp: new Date(h.date + 'T00:00:00').getTime(),
+        temperatures: h.sensors
+      })).sort((a, b) => a.timestamp - b.timestamp) : [];
 
-      this.sensors.push({ pos, temp, baseTemp: temp });
+      this.sensors.push({ pos, temp, baseTemp: temp, history: parsedHistory, indexInCable: s } as any);
 
       const label = this.createLabel(`S${s + 1}`, 'sensor-label');
       label.position.copy(pos);
@@ -402,8 +452,8 @@ class SiloApp {
 
   getRoofHeight(x: number, z: number): number {
     const dist = Math.sqrt(x * x + z * z);
-    const roofTipHeight = 3;
     const roofRadius = SILO_RADIUS * 1.05;
+    const roofTipHeight = roofRadius * ROOF_SLOPE;
     return SILO_HEIGHT + roofTipHeight * (1 - Math.min(dist / roofRadius, 1));
   }
 
@@ -442,8 +492,10 @@ class SiloApp {
     cylinder.position.y = SILO_HEIGHT / 2;
     group.add(cylinder);
 
-    // Roof (Cone)
-    const coneGeo = new THREE.ConeGeometry(SILO_RADIUS * 1.05, 3, 64, 1, true);
+    // Roof (Slope as defined)
+    const roofRadius = SILO_RADIUS * 1.05;
+    const coneHeight = roofRadius * ROOF_SLOPE;
+    const coneGeo = new THREE.ConeGeometry(roofRadius, coneHeight, 64, 1, true);
     const coneMaterial = new THREE.MeshStandardMaterial({
       color: 0xdddddd,
       map: siloTexture,
@@ -454,7 +506,7 @@ class SiloApp {
       clippingPlanes: [this.clippingPlane]
     });
     const cone = new THREE.Mesh(coneGeo, coneMaterial);
-    cone.position.y = SILO_HEIGHT + 1.5;
+    cone.position.y = SILO_HEIGHT + coneHeight / 2;
     group.add(cone);
 
     const floorGeo = new THREE.CircleGeometry(SILO_RADIUS * 1.5, 64);
@@ -537,12 +589,12 @@ class SiloApp {
       const z = Math.sin(angle) * radius;
 
       this.cableLevels.push({ pos: new THREE.Vector2(x, z), height: GRAIN_HEIGHT });
-      this.addCable(x, z, SENSORS_PER_CABLE);
+      this.addCable(x, z, SENSORS_PER_CABLE, []);
     }
 
     // 1 Central Cable (11 sensors)
     this.cableLevels.push({ pos: new THREE.Vector2(0, 0), height: GRAIN_HEIGHT });
-    this.addCable(0, 0, 11);
+    this.addCable(0, 0, 11, []);
   }
 
   initGrainMass() {
@@ -551,7 +603,7 @@ class SiloApp {
     const sizes = new Float32Array(count); // Individual sizes
 
     for (let i = 0; i < count; i++) {
-      const r = Math.sqrt(Math.random()) * SILO_RADIUS;
+      const r = Math.sqrt(Math.random()) * (SILO_RADIUS * 0.98);
       const theta = Math.random() * Math.PI * 2;
       const x = r * Math.cos(theta);
       const z = r * Math.sin(theta);
@@ -570,7 +622,7 @@ class SiloApp {
 
       // Pile Effect (Natural Heap/Angle of Repose)
       const distFromCenter = r / SILO_RADIUS;
-      const heapHeight = 1.8;
+      const heapHeight = 0.6;
       const domeEffect = Math.cos(distFromCenter * (Math.PI / 2)) * heapHeight;
       yMax += domeEffect;
 
@@ -632,6 +684,16 @@ class SiloApp {
     this.gui = new GUI();
     const folder = this.gui.addFolder('Controles');
 
+    folder.add(this.params, 'timelineValue', 0, 1).name('Linha do Tempo').onChange(() => {
+      this.params.isPlaying = false; // Pause on manual scrub
+      this.updateInterpolation();
+    });
+
+    folder.add(this.params, 'playbackDate').name('Data').listen().disable();
+
+    folder.add(this.params, 'isPlaying').name('Reproduzir (Play)').listen();
+    folder.add(this.params, 'playSpeed', 1, 10, 1).name('Velocidade (x)');
+
     folder.add(this.params, 'slicing', -SILO_RADIUS, SILO_RADIUS).name('Fatiar (X)').onChange((v: number) => {
       this.clippingPlane.constant = v;
       if (this.grainPoints) {
@@ -676,6 +738,56 @@ class SiloApp {
     folder.open();
   }
 
+  updateInterpolation() {
+    const currentTime = this.timelineStart + this.params.timelineValue * (this.timelineEnd - this.timelineStart);
+    
+    // Update Date Display
+    const date = new Date(currentTime);
+    this.params.playbackDate = date.toLocaleDateString('pt-BR') + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+
+    this.sensors.forEach(s => {
+      if (s.history.length === 0) {
+        s.temp = s.baseTemp;
+        return;
+      }
+
+      // Find snapshots flanking currentTime
+      let prev = s.history[0];
+      let next = s.history[s.history.length - 1];
+
+      // If current time is before first or after last, clamp
+      if (currentTime <= prev.timestamp) {
+        s.temp = prev.temperatures[this.getSensorIndex(s)];
+      } else if (currentTime >= next.timestamp) {
+        s.temp = next.temperatures[this.getSensorIndex(s)];
+      } else {
+        // Find interval
+        for (let i = 0; i < s.history.length - 1; i++) {
+          if (currentTime >= s.history[i].timestamp && currentTime <= s.history[i+1].timestamp) {
+            prev = s.history[i];
+            next = s.history[i+1];
+            break;
+          }
+        }
+
+        const t = (currentTime - prev.timestamp) / (next.timestamp - prev.timestamp);
+        const sensorIdx = this.getSensorIndex(s);
+        s.temp = THREE.MathUtils.lerp(prev.temperatures[sensorIdx], next.temperatures[sensorIdx], t);
+      }
+    });
+
+    if (this.grainPoints) {
+      this.updateSensorUniforms((this.grainPoints.material as THREE.ShaderMaterial).uniforms.sensors.value);
+    }
+  }
+
+  getSensorIndex(sensor: any): number {
+    // Find index of sensor in the global sensors array relative to its cable
+    // This is a bit tricky, let's optimize addCable to store index in history
+    // For now, we'll just store the index in the sensor object during addCable
+    return (sensor as any).indexInCable;
+  }
+
   onResize() {
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
@@ -685,26 +797,34 @@ class SiloApp {
   animate() {
     requestAnimationFrame(this.animate.bind(this));
 
+    if (this.params.isPlaying) {
+      // 1 day (86400000ms) = 3 seconds (3000ms real)
+      // So rate is 86400000 / 3000 = 28800ms simulation per 1ms real
+      // We use clock delta for consistency
+      const delta = 16.6; // approx 60fps, can use THREE.Clock for better precision
+      const dayInMs = 86400000;
+      const dayWaitSeconds = 3;
+      const simulationStep = (delta / (dayWaitSeconds * 1000)) * dayInMs * this.params.playSpeed;
+      
+      const totalDuration = this.timelineEnd - this.timelineStart;
+      if (totalDuration > 0) {
+        this.params.timelineValue += simulationStep / totalDuration;
+        if (this.params.timelineValue >= 1) {
+            this.params.timelineValue = 0; // Loop or stop
+            // this.params.isPlaying = false;
+        }
+        this.updateInterpolation();
+      }
+    }
+
     if (this.params.animateSensors) {
       const time = performance.now() * 0.001;
       this.sensors.forEach((s, i) => {
-        // Fluctuate +/- 1.0 degree around baseTemp
-        s.temp = s.baseTemp + Math.sin(time + i * 0.1) * 1.5;
+        // Fluctuate around current temp
+        s.temp += Math.sin(time + i * 0.1) * 0.05; // Subtle noise
       });
 
       if (this.grainPoints) {
-        this.updateSensorUniforms((this.grainPoints.material as THREE.ShaderMaterial).uniforms.sensors.value);
-      }
-    } else {
-      // Reset to exact JSON values when animation is OFF
-      let changed = false;
-      this.sensors.forEach(s => {
-        if (s.temp !== s.baseTemp) {
-          s.temp = s.baseTemp;
-          changed = true;
-        }
-      });
-      if (changed && this.grainPoints) {
         this.updateSensorUniforms((this.grainPoints.material as THREE.ShaderMaterial).uniforms.sensors.value);
       }
     }
